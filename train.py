@@ -16,7 +16,7 @@ parser.add_argument('--rnd_dim', type=int, default=128)
 parser.add_argument('--num_layers', type=int, default=2)
 parser.add_argument('--num_steps', type=int, default=10)
 parser.add_argument('--lr', type=float, default=0.001)
-parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--batch_size', type=int, default=3)
 parser.add_argument('--epochs', type=int, default=15)
 parser.add_argument('--test_samples', type=int, default=1000)
 
@@ -69,25 +69,29 @@ def generate_y(y_col):
 for data in train_loader:
     data = data.to(device)
     print('node_emb_s : ',data.x_s.size(), ' node_emb_t: ',data.x_t.size())
-    out = model(data.x_s, data.edge_index_s, data.edge_attr_s,
-                data.x_t, data.edge_index_t, data.edge_attr_t)
+    print(data.y.size())
+    ground_truth = generate_y(data.y)
+    print(ground_truth.size())
+    out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
+                data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
+    # flattened labels [n_nodes_in_batch x ] 
     ground_truth = generate_y(data.y)
     break
 
-# def train():
-#     model.train()
+def train():
+    model.train()
 
-#     total_loss = 0
-#     for data in train_loader:
-#         optimizer.zero_grad()
-#         data = data.to(device)
-#         out = model(data.x_s, data.edge_index_s, data.edge_attr_s,
-#                     data.x_t, data.edge_index_t, data.edge_attr_t)
-#         y = generate_y(data.y)
-#         loss = model.loss(S_0, y)
-#         loss = model.loss(S_L, y) + loss if model.num_steps > 0 else loss
-#         loss.backward()
-#         optimizer.step()
-#         total_loss += loss.item() * (data.x_s_batch.max().item() + 1)
+    total_loss = 0
+    for data in train_loader:
+        optimizer.zero_grad()
+        data = data.to(device)
+        # out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
+        #             data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
 
-#     return total_loss / len(train_loader.dataset)
+        y = generate_y(data.y)
+        loss = model.loss(y, out)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * (data.x_s_batch.max().item() + 1)
+
+    return total_loss / len(train_loader.dataset)

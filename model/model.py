@@ -1,19 +1,29 @@
+import numpy as np
 import torch
 import torch.nn as nn
+from torch_geometric.utils import to_dense_batch
+
+
+
+def masked_softmax(src, mask, dim=-1):
+    out = src.masked_fill(~mask, float('-inf'))
+    out = torch.softmax(out, dim=dim)
+    out = out.masked_fill(~mask, 0)
+    return out
 
 def make_queries(h_s, h_t):
-    n_s = h_s.size(dim=0)
-    n_t = h_t.size(dim=0)
+    n_s = h_s.size(dim=1)
+    n_t = h_t.size(dim=1)
 
     queries = []
 
     for i in range(0,n_s):
         for j in range(0, n_t):
-            query = torch.cat((h_s[i,:], h_t[j,:]))
+            query = torch.cat((h_s[:,i,:], h_t[:,j,:]), dim=-1)
             queries.append(query)
-    queries = torch.stack(queries, dim=0)
-    return queries
+    queries = torch.stack(queries, dim=1)
 
+    return queries
 class Net(nn.Module):
     def __init__(self, psi, node_dim, hidden_size, hidden_out):
         # args for transformer to add: nhead, num_encoder_layers, num_decoder_layers
@@ -28,29 +38,62 @@ class Net(nn.Module):
         self.transformer = nn.Transformer(d_model= hidden_out,
                                           nhead=4, 
                                           num_encoder_layers=8, 
-                                          num_decoder_layers=6)
-        self.mlp_out = MLP([256, 256], 256)
+                                          num_decoder_layers=6,
+                                          batch_first=True)
+        self.mlp_out = MLP([256, 256], 1)
+       
         
-    def forward(self, x_s, edge_index_s, edge_attr_s,
-                x_t, edge_index_t, x_t_edge_attr_t):
+    def forward(self, x_s, edge_index_s, edge_attr_s, batch_s,
+                x_t, edge_index_t, edge_attr_t, batch_t):
         
         h_s = self.spline(x_s, edge_index_s, edge_attr_s)
-        print('h_s: ', h_s.size())
-        h_t = self.spline(x_t, edge_index_t, x_t_edge_attr_t)
-        print('h_t: ', h_t.size())
+        h_t = self.spline(x_t, edge_index_t, edge_attr_t)
 
-        input = torch.cat((h_s, h_t), dim=0)
+        h_s, s_mask = to_dense_batch(h_s, batch_s, fill_value=0)
+        h_t, t_mask = to_dense_batch(h_t, batch_t, fill_value=0)
+
+        print('batched h_s: ', h_s.size())
+        print('batched h_t: ', h_t.size())
+
+        assert h_s.size(0) == h_t.size(0), 'batch-sizes are not equal'
+        (B, N_s, D), N_t = h_s.size(), h_t.size(1)
+
+        S_mask = ~torch.cat((s_mask, t_mask), dim=1)
+        query_mask = ~(s_mask.view(B, N_s, 1) & t_mask.view(B, 1, N_t))
+        query_mask = query_mask.view(B, -1)
+        print('src_mask size', S_mask.size())
+        print('tgt_mask size', query_mask.size())
+
+        input = torch.cat((h_s, h_t), dim=1)
         print('in_transformer: ', input.size())
         queries = make_queries(h_s, h_t)
         print('queries: ', queries.size())
         queries = self.mlp(queries)
         print('mlp out: ', queries.size())
-        output = self.transformer(input, queries)
-        print('out_transformer: ', output.size())
-        output = self.mlp_out(output)
-        out = torch.softmax(output, dim=1)
+        transformer_out = self.transformer(input, 
+                                  queries, 
+                                  src_key_padding_mask= S_mask, 
+                                  tgt_key_padding_mask= query_mask)
+        print('out_transformer: ', transformer_out.size())
+        output = self.mlp_out(transformer_out)
+        print('output: ', output.size())
+        cost_matrix = -output.view(B, 10, 10)
+        print('cost_matrix: ', cost_matrix.size())
 
-        return out
+        '''
+        transformer_out : [B, ns x nt, D]
+        cost_matrix : [B, ns, nt]
+        linear assignment: [B, 2, 10]
+        out : [B * ns] remove masked nodes
+        '''
+
+        return cost_matrix
+        
+
+    
+    def loss(self, y, y_hat):
+        loss_fn = nn.CrossEntropyLoss()
+        return loss_fn(y_hat,y)
 
 
 class MLP(nn.Module):
