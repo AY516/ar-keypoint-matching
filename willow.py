@@ -159,7 +159,7 @@ def test(test_dataset):
             
             num_correct, num_samples = acc(data_t.num_graphs, data_s.batch.size()[0], y_pred)
             
-            perm_mat_gt = torch.eye(10).expand(batch_size, C.size(0), C.size(1))
+            # perm_mat_gt = torch.eye(10).expand(batch_size, C.size(0), C.size(1))
             perm_mat_pred = []
             correct += num_correct
             num_examples += num_samples
