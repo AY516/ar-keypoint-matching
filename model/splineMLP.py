@@ -54,20 +54,17 @@ class SimpleNet(nn.Module):
     
         h_s, s_mask = to_dense_batch(h_s, batch_s, fill_value=0)
         h_t, t_mask = to_dense_batch(h_t, batch_t, fill_value=0)
-
+        
         (B, N_s, D), N_t = h_s.size(), h_t.size(1)
-
-        #print('batched h_s: ', h_s.size())
-        #print('batched h_t: ', h_t.size())
+        query_mask = (s_mask.view(B, N_s, 1) & t_mask.view(B, 1, N_t))
+        query_mask = query_mask.view(B, -1)
 
         queries = make_queries(h_s, h_t)
         queries = self.mlp_proj(queries)
-        #print('queries: ', queries.size())
-
         output = self.mlp(queries).squeeze(2)
-        #print('mlp in: ', input.size())
-        #print('mlp out: ', output.size())
-        return output
+        masked_output = torch.where(query_mask, output, float(-10e6))
+
+        return masked_output
     
     def loss(self, y_hat, y):
         loss_fn = nn.BCEWithLogitsLoss()
