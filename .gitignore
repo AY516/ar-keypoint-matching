@@ -3,3 +3,4 @@
 /runs
 model/__pycache__/
 *.pt
+/*runs

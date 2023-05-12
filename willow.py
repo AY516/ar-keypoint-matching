@@ -29,7 +29,7 @@ parser.add_argument('--test_samples', type=int, default=1000)
 parser.add_argument('--mlp_hidden_dim', type=int, default=1024)
 parser.add_argument('--mlp_hidden_out', type=int, default=256)
 
-parser.add_argument('--model_path', type=str, default='model_test.pt')
+parser.add_argument('--model_path', type=str, default='model_willow_tf.pt')
 args = parser.parse_args()
 
 pre_filter1 = lambda d: d.num_nodes > 0  # noqa
@@ -207,7 +207,7 @@ def test(test_dataset, model: Optional[torch.nn.Module] = None):
             
             if num_examples == 0:
                 # logits contain large -ve values, which gives incorrect heatmaps on normalising
-                # abs and reciprocal circumvents this problem
+                # applying softmax along the rows circumvents this problem
                 score_map = torch.nn.functional.softmax(-C[0,:,:], dim=0)
             
             perm_mat_gt = make_perm_mat_gt(batch_size, 10)
@@ -230,30 +230,6 @@ def test(test_dataset, model: Optional[torch.nn.Module] = None):
                 # print('--------------------------')
                 return accuracy, f1, score_map, test_loss
 
-def train_tf(train_loader, optimizer):
-    model.train()
-    total_loss = 0
-    for data in train_loader:
-        optimizer.zero_grad()
-        data = data.to(device)
-        # print('node_emb_s : ',data.x_s.size(), ' node_emb_t: ',data.x_t.size())
-
-        num_graphs = data.x_s_batch.max().item() + 1
-        y = generate_y(num_nodes=data.x_s_batch.size()[0], batch_size= num_graphs).to(device)
-        C = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
-                    data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
-
-        o = np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) for x in range(num_graphs)])
-        o = torch.as_tensor(o,dtype=torch.int64)
-        o_col = o[:,1,:]
-    #     out = o_col.contiguous().view(50).to(device)
-    #     loss = model.loss(y_logits, y)
-    
-    #     loss.backward()
-    #     optimizer.step()
-    #     total_loss += loss.item()
-        
-    # return total_loss
 
 def run(train_loader, optimizer, test_datasets):
     writer = SummaryWriter(log_dir=

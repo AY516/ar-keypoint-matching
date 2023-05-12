@@ -52,8 +52,8 @@ class Net(nn.Module):
         h_s, s_mask = to_dense_batch(h_s, batch_s, fill_value=0)
         h_t, t_mask = to_dense_batch(h_t, batch_t, fill_value=0)
 
-        print('batched h_s: ', h_s.size())
-        print('batched h_t: ', h_t.size())
+        # print('batched h_s: ', h_s.size())
+        # print('batched h_t: ', h_t.size())
 
         assert h_s.size(0) == h_t.size(0), 'batch-sizes are not equal'
         (B, N_s, D), N_t = h_s.size(), h_t.size(1)
@@ -61,25 +61,22 @@ class Net(nn.Module):
         S_mask = ~torch.cat((s_mask, t_mask), dim=1)
         query_mask = ~(s_mask.view(B, N_s, 1) & t_mask.view(B, 1, N_t))
         query_mask = query_mask.view(B, -1)
-        print('src_mask size', S_mask.size())
-        print('tgt_mask size', query_mask.size())
+        # print('src_mask size', S_mask.size())
+        # print('tgt_mask size', query_mask.size())
 
         input = torch.cat((h_s, h_t), dim=1)
-        print('in_transformer: ', input.size())
+        # print('in_transformer: ', input.size())
         queries = make_queries(h_s, h_t)
-        print('queries: ', queries.size())
+        # print('queries: ', queries.size())
         queries = self.mlp(queries)
-        print('mlp out: ', queries.size())
+        # print('mlp out: ', queries.size())
         transformer_out = self.transformer(input, 
                                   queries, 
                                   src_key_padding_mask= S_mask, 
                                   tgt_key_padding_mask= query_mask)
-        print('out_transformer: ', transformer_out.size())
+        # print('out_transformer: ', transformer_out.size())
         output = self.mlp_out(transformer_out)
-        print('output: ', output.size())
-        cost_matrix = -output.view(B, 10, 10)
-        print('cost_matrix: ', cost_matrix.size())
-
+        # print('output: ', output.size())
         '''
         transformer_out : [B, ns x nt, D]
         cost_matrix : [B, ns, nt]
@@ -87,7 +84,7 @@ class Net(nn.Module):
         out : [B * ns] remove masked nodes
         '''
 
-        return cost_matrix
+        return output.squeeze(2)
         
 
     

@@ -1,10 +1,15 @@
 import os.path as osp
 import argparse
+from typing import Optional
+from datetime import datetime
+from tqdm import tqdm
+
 import torch
 from torch_geometric.datasets import PascalVOCKeypoints as PascalVOC
-from utils import ValidPairDataset
+from utils import ValidPairDataset, compute_grad_norm, matching_accuracy, make_perm_mat_pred, get_pos_neg, f1_score
 import torch_geometric.transforms as T
 from torch_geometric.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from model import SplineCNN, Net, SimpleNet
 from scipy.optimize import linear_sum_assignment
@@ -17,12 +22,13 @@ parser.add_argument('--rnd_dim', type=int, default=128)
 parser.add_argument('--num_layers', type=int, default=2)
 parser.add_argument('--num_steps', type=int, default=10)
 parser.add_argument('--lr', type=float, default=0.001)
-parser.add_argument('--batch_size', type=int, default=3)
+parser.add_argument('--batch_size', type=int, default=256)
 parser.add_argument('--epochs', type=int, default=15)
 parser.add_argument('--test_samples', type=int, default=1000)
 
 parser.add_argument('--mlp_hidden_dim', type=int, default=1024)
 parser.add_argument('--mlp_hidden_out', type=int, default=256)
+parser.add_argument('--model_path', type=str, default='pascal_ep_30_with_heatmap.pt')
 args = parser.parse_args()
 
 
@@ -44,13 +50,21 @@ for category in PascalVOC.categories:
                         pre_filter=pre_filter)
     test_datasets += [ValidPairDataset(dataset, dataset, sample=True)]
  
-# graph transformed VGG-16 keypoints
+# graph transformed VGG-16
 train_dataset = torch.utils.data.ConcatDataset(train_datasets)
-train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True,
-                          follow_batch=['x_s', 'x_t'])
 
+# split into train and validation set
+val_size = int(0.2 * len(train_dataset))
+train_size = len(train_dataset) - val_size
+train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, 
+                          follow_batch=['x_s', 'x_t'])
+val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, 
+                        follow_batch=['x_s', 'x_t'])
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(device)
 print(torch.cuda.get_device_name())
 
 # geometry-aware refinement
@@ -62,27 +76,6 @@ psi_1 = SplineCNN(dataset.num_node_features, args.dim,
 mlp_hidden_dim = 1024
 model = SimpleNet(psi_1, args.dim, args.mlp_hidden_dim, args.mlp_hidden_out).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-def generate_y(y_col):
-    y_row = torch.arange(y_col.size(0), device=device)
-    return torch.stack([y_row, y_col], dim=0)
-
-def generate_y_cart(num_nodes, batch_size):
-    node_idx_s = torch.arange(num_nodes/batch_size, dtype=int)
-    node_idx_t = torch.arange(num_nodes/batch_size, dtype=int)
-    y_cart_prod = torch.cartesian_prod(node_idx_s, node_idx_t)
-    y = torch.zeros_like(y_cart_prod[:,0])
-    y[y_cart_prod[:,0] == y_cart_prod[:,1]] = 1
-    y = y.expand(batch_size, y.size()[0])
-    return y.type(torch.DoubleTensor)
-
-def acc(batch_size, num_nodes_s, y_pred):
-    correct = total = 0
-    y_pred = y_pred[:,1,:]
-    y_gt = torch.arange(num_nodes_s/batch_size, dtype=int).to(device)
-    y_gt = y_gt.expand(batch_size, y_gt.size()[0])
-    num_samples = y_gt.size()[0] * y_gt.size()[1]
-    return torch.eq(y_pred, y_gt).sum(), num_samples
 
 def make_multi_label_tensor(y_gt_target, x_s_batch, x_t_batch):
 
@@ -100,47 +93,94 @@ def make_multi_label_tensor(y_gt_target, x_s_batch, x_t_batch):
     num_graphs = len(torch.unique(x_s_batch))
     
     out_tensor = torch.zeros(num_graphs,num_nodes_s*num_nodes_t)
+    perm_mat_gt = []
 
     for i in range(num_graphs):
         corr_tensor = torch.zeros(num_nodes_s, num_nodes_t)
-        src_idx = torch.masked_select(y_gt_source, (x_s_batch == 0))
-        tgt_idx = torch.masked_select(y_gt_target, (x_s_batch == 0))
+        src_idx = torch.masked_select(y_gt_source, (x_s_batch == i))
+        tgt_idx = torch.masked_select(y_gt_target, (x_s_batch == i))
         corr_tensor[src_idx, tgt_idx] = 1
+        perm_mat_gt.append(corr_tensor)
         out_tensor[i,: ] = corr_tensor.flatten()
+    perm_mat_gt = torch.stack(perm_mat_gt)
+    
+    return out_tensor.to(device=device), perm_mat_gt.to(device=device)
 
-    return out_tensor.to(device=device)
 
-# total_loss = 0
-# for data in train_loader:
-#     optimizer.zero_grad()
-#     data = data.to(device)
-#     y_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
-#     out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
-#                 data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
- 
-#     loss = model.loss(out,y_gt)
-#     loss.backward()
-#     optimizer.step()
-#     total_loss += loss.item()
-#     break
-
-def train():
+def train(epoch, writer):
+    
     model.train()
-
     total_loss = 0
-    for data in train_loader:
+    train_total_correct = train_total_samples = 0
+    val_total_correct = val_total_samples = 0
+    num_correct = num_samples = 0 
+    for i, data in enumerate(train_loader):
         optimizer.zero_grad()
         data = data.to(device)
-        y_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
+
+        num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
+        num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
+
+        y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
         out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
                     data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
-    
+        
         loss = model.loss(out,y_gt)
         loss.backward()
+
+        # grad norm
+        grad_norm_model = compute_grad_norm(model.parameters())
+        grad_norm_splineCNN = compute_grad_norm(model.spline.parameters())
+        grad_mlp_proj = compute_grad_norm(model.mlp_proj.parameters())
+        grad_mlp = compute_grad_norm(model.mlp.parameters())
+        writer.add_scalars('grad norms',{'model': grad_norm_model,
+                                        'grad norm Spline': grad_norm_splineCNN,
+                                        'grad norm tf': grad_mlp_proj,
+                                        'grad norm mlp': grad_mlp}, (epoch-1)*len(train_loader) + i)
+        # train accuracy
+        C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
+        y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
+                                            for x in range(data.num_graphs)])).to(device)
+        perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
+
+        _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
+        train_total_correct += num_correct
+        train_total_samples += num_samples
         optimizer.step()
         total_loss += loss.item()
+    
+    model.eval()
+    valid_loss = 0.0
+    for i, data in enumerate(val_loader):
+        data = data.to(device)
 
-    return total_loss / len(train_loader.dataset)
+        num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
+        num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
+
+        y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
+        out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
+                    data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
+        
+        C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
+        y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
+                                            for x in range(data.num_graphs)])).to(device)
+        perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
+
+        _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
+        val_total_correct += num_correct
+        val_total_samples += num_samples
+
+        loss = model.loss(out,y_gt)
+        valid_loss += loss.item() 
+
+    valid_loss = valid_loss / len(train_loader)
+    train_loss = total_loss / len(train_loader)
+
+    train_acc = train_total_correct / train_total_samples
+    valid_acc = val_total_correct / val_total_samples
+
+    return {'train_loss': train_loss, 'train_acc':train_acc, 
+            'valid_loss': valid_loss, 'valid_acc': valid_acc}
 
 @torch.no_grad()
 def test(dataset):
@@ -148,23 +188,91 @@ def test(dataset):
 
     loader = DataLoader(dataset, args.batch_size, shuffle=False,
                         follow_batch=['x_s', 'x_t'])
-
-    correct = num_examples = 0
-    while (num_examples < args.test_samples):
+    
+    test_samples = test_total_correct = 0
+    tp = fp = fn = 0
+    while (test_samples < args.test_samples):
         for data in loader:
+            data = data.to(device)
+            
+            num_graphs = data.x_s_batch.max().item() + 1
             num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
             num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
-            num_graphs = len(torch.unique(data.x_s_batch))
+            nodes_in_test_batch  = torch.bincount(data.x_s_batch)
             
-            data = data.to(device)
-            out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
-                        data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
-            y_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
-
-            C = -out.view(num_graphs, num_nodes_s, num_nodes_t)
+            out = model(data.x_s, data.edge_index_s, data.edge_attr_s,
+                             data.x_s_batch, data.x_t, data.edge_index_t,
+                             data.edge_attr_t, data.x_t_batch)
+            _, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
+            
+            C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
             y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
-                                            for x in range(num_graphs)])).to(device)
-            num_correct, num_samples += acc(num_graphs, num_nodes_s, y_pred)
+                                            for x in range(data.num_graphs)])).to(device)
+            perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
 
-            if num_examples >= args.test_samples:
-                return num_correct / num_examples
+            _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
+            
+            if num_samples == 0:
+                # logits contain large -ve values, which gives incorrect heatmaps on normalising
+                # applying softmax along the rows circumvents this problem
+                score_map = torch.nn.functional.softmax(-C[0,:,:], dim=0)
+            
+            _tp, _fp, _fn = get_pos_neg(perm_gt, perm_pred)
+            tp += _tp
+            fp += _fp
+            fn += _fn
+            test_total_correct += num_correct
+            test_samples += num_samples
+
+            if test_samples >= args.test_samples:
+                f1 = f1_score(tp, fp, fn)
+                return test_total_correct / test_samples, f1
+
+
+def run(test_datasets):
+    writer = SummaryWriter(log_dir=
+                           "runs/{}".format(args.model_path + datetime.now().strftime("%Y%m%d-%H%M%S")))
+    
+    for epoch in tqdm(range(1, args.epochs+ 1)):
+        train_metrics = train(epoch, writer)
+        loss = train_metrics['train_loss']
+        
+        writer.add_scalar('loss/train', train_metrics['train_loss'], epoch)
+        writer.add_scalar('loss/val', train_metrics['valid_loss'], epoch)
+        writer.add_scalar('accuracy/train', train_metrics['train_acc'], epoch)
+        writer.add_scalar('accuracy/val', train_metrics['valid_acc'], epoch)
+
+        print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}')
+    
+    torch.save(model.state_dict(), args.model_path)
+    model.load_state_dict(torch.load(args.model_path))
+
+    accs = [100 * test(test_dataset)[0] for test_dataset in test_datasets]
+    accs += [sum(accs) / len(accs)]
+
+    f1 = [100 * test(test_dataset)[1] for test_dataset in test_datasets]
+    f1 += [sum(f1) / len(f1)]   
+
+    # for i, test_dataset in enumerate(test_datasets):
+    #     writer.add_image("heatmaps/{cat}".format(cat=PascalVOC.categories[i]), 
+    #                      test(test_dataset)[2], dataformats='HW')
+
+    print(' '.join([c[:5].ljust(5) for c in PascalVOC.categories] + ['mean']))
+    print(' '.join([f'{acc:.1f}'.ljust(5) for acc in accs]))
+    print(' '.join([f'{f1:.1f}'.ljust(5) for f1 in f1]))
+
+
+run(test_datasets)
+
+# torch.save(model.state_dict(), args.model_path)
+# model.load_state_dict(torch.load(args.model_path))
+
+# accs = [100 * test(test_dataset)[0] for test_dataset in test_datasets]
+# accs += [sum(accs) / len(accs)]
+
+# f1 = [100 * test(test_dataset)[1] for test_dataset in test_datasets]
+# f1 += [sum(f1) / len(f1)]
+
+# print(' '.join([c[:5].ljust(5) for c in PascalVOC.categories] + ['mean']))
+# print(' '.join([f'{acc:.1f}'.ljust(5) for acc in accs]))
+# print(' '.join([f'{f1:.1f}'.ljust(5) for f1 in f1])
