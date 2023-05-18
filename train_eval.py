@@ -6,76 +6,17 @@ from tqdm import tqdm
 
 import torch
 from torch_geometric.datasets import PascalVOCKeypoints as PascalVOC
-from utils import ValidPairDataset, compute_grad_norm, matching_accuracy, make_perm_mat_pred, get_pos_neg, f1_score
+from utils.evaluation import *
 import torch_geometric.transforms as T
 from torch_geometric.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from model import SplineCNN, Net, SimpleNet
+from datasets.willow_obj import WillowObject
+from datasets.pascal_obj import PascalObject
+
 from scipy.optimize import linear_sum_assignment
 import numpy as np
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--isotropic', action='store_true')
-parser.add_argument('--dim', type=int, default=256)
-parser.add_argument('--rnd_dim', type=int, default=128)
-parser.add_argument('--num_layers', type=int, default=2)
-parser.add_argument('--num_steps', type=int, default=10)
-parser.add_argument('--lr', type=float, default=0.001)
-parser.add_argument('--batch_size', type=int, default=256)
-parser.add_argument('--epochs', type=int, default=15)
-parser.add_argument('--test_samples', type=int, default=1000)
-
-parser.add_argument('--mlp_hidden_dim', type=int, default=1024)
-parser.add_argument('--mlp_hidden_out', type=int, default=256)
-parser.add_argument('--model_path', type=str, default='pascal_ep_30.pt')
-args = parser.parse_args()
-
-
-pre_filter = lambda data: data.pos.size(0) > 0  # noqa
-transform = T.Compose([
-    T.Delaunay(),
-    T.FaceToEdge(),
-    T.Distance() if args.isotropic else T.Cartesian(),
-])
-train_datasets = []
-test_datasets = []
-path = osp.join('.','data','PascalVOC')
-
-for category in PascalVOC.categories:
-    dataset = PascalVOC(path, category, train=True, transform=transform,
-                        pre_filter=pre_filter)
-    train_datasets += [ValidPairDataset(dataset, dataset, sample=True)]
-    dataset = PascalVOC(path, category, train=False, transform=transform,
-                        pre_filter=pre_filter)
-    test_datasets += [ValidPairDataset(dataset, dataset, sample=True)]
- 
-# graph transformed VGG-16
-train_dataset = torch.utils.data.ConcatDataset(train_datasets)
-
-# split into train and validation set
-val_size = int(0.2 * len(train_dataset))
-train_size = len(train_dataset) - val_size
-train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
-
-train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, 
-                          follow_batch=['x_s', 'x_t'])
-val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, 
-                        follow_batch=['x_s', 'x_t'])
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(device)
-print(torch.cuda.get_device_name())
-
-# geometry-aware refinement
-psi_1 = SplineCNN(dataset.num_node_features, args.dim,
-                  dataset.num_edge_features, args.num_layers, cat=False,
-                  dropout=0.5)
-
-# Spline-CNN -> MLP -> transformer_enc -> queries
-mlp_hidden_dim = 1024
-model = SimpleNet(psi_1, args.dim, args.mlp_hidden_dim, args.mlp_hidden_out).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 def make_multi_label_tensor(y_gt_target, x_s_batch, x_t_batch):
 
@@ -106,10 +47,10 @@ def make_multi_label_tensor(y_gt_target, x_s_batch, x_t_batch):
     
     return out_tensor.to(device=device), perm_mat_gt.to(device=device)
 
-
-def train(epoch, writer):
+def train(epoch, writer, train_loader, val_loader):
     
     model.train()
+    metrics={}
     total_loss = 0
     train_total_correct = train_total_samples = 0
     val_total_correct = val_total_samples = 0
@@ -149,38 +90,38 @@ def train(epoch, writer):
         optimizer.step()
         total_loss += loss.item()
     
-    model.eval()
-    valid_loss = 0.0
-    for i, data in enumerate(val_loader):
-        data = data.to(device)
+    metrics['train_loss'] = total_loss / len(train_loader)
+    metrics['train_acc'] = train_total_correct / train_total_samples
+    
+    if val_loader != None:
+        model.eval()
+        valid_loss = 0.0
+        for i, data in enumerate(val_loader):
+            data = data.to(device)
 
-        num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
-        num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
+            num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
+            num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
 
-        y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
-        out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
-                    data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
-        
-        C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
-        y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
-                                            for x in range(data.num_graphs)])).to(device)
-        perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
+            y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
+            out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
+                        data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
+            
+            C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
+            y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
+                                                for x in range(data.num_graphs)])).to(device)
+            perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
 
-        _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
-        val_total_correct += num_correct
-        val_total_samples += num_samples
+            _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
+            val_total_correct += num_correct
+            val_total_samples += num_samples
 
-        loss = model.loss(out,y_gt)
-        valid_loss += loss.item() 
+            loss = model.loss(out,y_gt)
+            valid_loss += loss.item() 
 
-    valid_loss = valid_loss / len(train_loader)
-    train_loss = total_loss / len(train_loader)
+        metrics['valid_loss'] = valid_loss / len(val_loader)
+        metrics['valid_acc'] = val_total_correct / val_total_samples
 
-    train_acc = train_total_correct / train_total_samples
-    valid_acc = val_total_correct / val_total_samples
-
-    return {'train_loss': train_loss, 'train_acc':train_acc, 
-            'valid_loss': valid_loss, 'valid_acc': valid_acc}
+    return metrics
 
 @torch.no_grad()
 def test(dataset):
@@ -228,24 +169,31 @@ def test(dataset):
                 f1 = f1_score(tp, fp, fn)
                 return test_total_correct / test_samples, f1
 
-
-def run(test_datasets):
-    writer = SummaryWriter(log_dir=
-                           "runs/{}".format(args.model_path + datetime.now().strftime("%Y%m%d-%H%M%S")))
+def run(dataset, train_loader, test_datasets, logdir, val_set):
+    writer = SummaryWriter(logdir)
     
     for epoch in tqdm(range(1, args.epochs+ 1)):
-        train_metrics = train(epoch, writer)
+        train_metrics = train(epoch, writer,train_loader, val_set)
         loss = train_metrics['train_loss']
+        train_acc = train_metrics['train_acc']
+
         
         writer.add_scalar('loss/train', train_metrics['train_loss'], epoch)
-        writer.add_scalar('loss/val', train_metrics['valid_loss'], epoch)
         writer.add_scalar('accuracy/train', train_metrics['train_acc'], epoch)
-        writer.add_scalar('accuracy/val', train_metrics['valid_acc'], epoch)
+        
+        if val_set != None:
+            writer.add_scalar('loss/val', train_metrics['valid_loss'], epoch)
+            writer.add_scalar('accuracy/val', train_metrics['valid_acc'], epoch)
+            val_acc = train_metrics['train_acc']
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Val_acc: {val_acc:.4f}')
 
-        print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}')
+        else:
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train_acc: {train_acc:.4f}')
+
+
     
-    torch.save(model.state_dict(), args.model_path)
-    model.load_state_dict(torch.load(args.model_path))
+    # torch.save(model.state_dict(), args.model_path)
+    # model.load_state_dict(torch.load(args.model_path))
 
     accs = [100 * test(test_dataset)[0] for test_dataset in test_datasets]
     accs += [sum(accs) / len(accs)]
@@ -257,22 +205,75 @@ def run(test_datasets):
     #     writer.add_image("heatmaps/{cat}".format(cat=PascalVOC.categories[i]), 
     #                      test(test_dataset)[2], dataformats='HW')
 
-    print(' '.join([c[:5].ljust(5) for c in PascalVOC.categories] + ['mean']))
+    print(' '.join([c[:5].ljust(5) for c in dataset.categories] + ['mean']))
     print(' '.join([f'{acc:.1f}'.ljust(5) for acc in accs]))
     print(' '.join([f'{f1:.1f}'.ljust(5) for f1 in f1]))
 
 
-run(test_datasets)
+if __name__ == '__main__':
 
-# torch.save(model.state_dict(), args.model_path)
-model.load_state_dict(torch.load(args.model_path))
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--isotropic', action='store_true')
+    parser.add_argument('--dim', type=int, default=256)
+    parser.add_argument('--rnd_dim', type=int, default=128)
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--num_steps', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--test_samples', type=int, default=1000)
 
-accs = [100 * test(test_dataset)[0] for test_dataset in test_datasets]
-accs += [sum(accs) / len(accs)]
+    parser.add_argument('--mlp_hidden_dim', type=int, default=1024)
+    parser.add_argument('--mlp_hidden_out', type=int, default=256)
+    
+    parser.add_argument('--model_path', type=str, default='pascal.pt')
+    parser.add_argument('--dataset', type=str, default='PascalVOC')
 
-f1 = [100 * test(test_dataset)[1] for test_dataset in test_datasets]
-f1 += [sum(f1) / len(f1)]
+    args = parser.parse_args()
+    log_dir="{}_SimpleNet_runs/{}".format(args.dataset, args.model_path + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(device)
 
-print(' '.join([c[:5].ljust(5) for c in PascalVOC.categories] + ['mean']))
-print(' '.join([f'{acc:.1f}'.ljust(5) for acc in accs]))
-print(' '.join([f'{f1:.1f}'.ljust(5) for f1 in f1]))
+    pre_filter = lambda data: data.pos.size(0) > 0  # noqa
+    transform = T.Compose([
+        T.Delaunay(),
+        T.FaceToEdge(),
+        T.Distance() if args.isotropic else T.Cartesian(),
+    ])
+
+    datasets = {'PascalVOC': PascalObject(transform, pre_filter),
+                'WillowOBJ': WillowObject(transform),
+                'Spair-71k': ""
+                }
+    dataset = datasets['PascalVOC']
+    train_dataset, test_datasets, num_node_features, num_edge_features = dataset.load_dataset()
+
+    if dataset.have_validation_set():
+        val_size = int(0.2 * len(train_dataset))
+        train_size = len(train_dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, 
+                        follow_batch=['x_s', 'x_t'])
+        train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, 
+                        follow_batch=['x_s', 'x_t'])
+    else:
+        train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, 
+                        follow_batch=['x_s', 'x_t'])
+        val_loader = None
+
+    # geometry-aware refinement
+    psi_1 = SplineCNN(num_node_features, args.dim,
+                      num_edge_features, args.num_layers, cat=False,
+                      dropout=0.5)
+
+    # Spline-CNN -> MLP -> transformer_enc -> queries
+    mlp_hidden_dim = 1024
+    model = SimpleNet(psi_1, args.dim, args.mlp_hidden_dim, args.mlp_hidden_out).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    run(dataset, 
+        train_loader, 
+        test_datasets, 
+        log_dir, 
+        val_loader)

@@ -77,12 +77,6 @@ class Net(nn.Module):
         # print('out_transformer: ', transformer_out.size())
         output = self.mlp_out(transformer_out)
         # print('output: ', output.size())
-        '''
-        transformer_out : [B, ns x nt, D]
-        cost_matrix : [B, ns, nt]
-        linear assignment: [B, 2, 10]
-        out : [B * ns] remove masked nodes
-        '''
 
         return output.squeeze(2)
         
