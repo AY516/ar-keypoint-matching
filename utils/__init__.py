@@ -1,5 +1,6 @@
 from .data import PairDataset, ValidPairDataset
 from .evaluation import *
+from .config import *
 
 __all__ = [
     'PairDataset',

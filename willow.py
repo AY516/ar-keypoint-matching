@@ -42,6 +42,7 @@ transform = T.Compose([
 ])
 
 path = osp.join('.', 'data', 'WILLOW')
+print(path)
 datasets = [WILLOW(path, cat, transform) for cat in WILLOW.categories]
 
 datasets = [dataset.shuffle() for dataset in datasets]
@@ -57,7 +58,7 @@ train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True,
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+device = 'cpu'
 print(torch.cuda.get_device_name())
 
 # geometry-aware refinement

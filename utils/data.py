@@ -43,6 +43,8 @@ class PairDataset(torch.utils.data.Dataset):
         else:
             data_s = self.dataset_s[idx // len(self.dataset_t)]
             data_t = self.dataset_t[idx % len(self.dataset_t)]
+        
+        y = torch.arange(data_s.num_nodes)
 
         return PairData(
             x_s=data_s.x,
@@ -51,6 +53,7 @@ class PairDataset(torch.utils.data.Dataset):
             x_t=data_t.x,
             edge_index_t=data_t.edge_index,
             edge_attr_t=data_t.edge_attr,
+            y = y,
             num_nodes=None,
         )
 
