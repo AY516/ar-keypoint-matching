@@ -84,7 +84,6 @@ class MLP(nn.Module):
             # Feedforward
             for layer in self.hidden:
                 x = nn.functional.relu(layer(x))
-            # output= nn.functional.softmax(self.out(x), dim=1)
             output = self.out(x)
 
             return output

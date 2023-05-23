@@ -4,7 +4,6 @@ import torch.nn as nn
 from torch_geometric.utils import to_dense_batch
 
 
-
 def masked_softmax(src, mask, dim=-1):
     out = src.masked_fill(~mask, float('-inf'))
     out = torch.softmax(out, dim=dim)
@@ -37,8 +36,8 @@ class Net(nn.Module):
                                 )
         self.transformer = nn.Transformer(d_model= hidden_out,
                                           nhead=4, 
-                                          num_encoder_layers=8, 
-                                          num_decoder_layers=6,
+                                          num_encoder_layers=4, 
+                                          num_decoder_layers=4,
                                           batch_first=True)
         self.mlp_out = MLP([256, 256], 1)
        
@@ -72,7 +71,8 @@ class Net(nn.Module):
         # print('mlp out: ', queries.size())
         transformer_out = self.transformer(input, 
                                   queries, 
-                                  src_key_padding_mask= S_mask, 
+                                  src_key_padding_mask= S_mask,
+                                  memory_key_padding_mask= S_mask,
                                   tgt_key_padding_mask= query_mask)
         # print('out_transformer: ', transformer_out.size())
         output = self.mlp_out(transformer_out)
@@ -82,9 +82,9 @@ class Net(nn.Module):
         
 
     
-    def loss(self, y, y_hat):
-        loss_fn = nn.CrossEntropyLoss()
-        return loss_fn(y_hat,y)
+    def loss(self, y_hat, y):
+        loss_fn = nn.BCEWithLogitsLoss()
+        return loss_fn(y_hat, y)
 
 
 class MLP(nn.Module):
@@ -101,8 +101,7 @@ class MLP(nn.Module):
             # Feedforward
             for layer in self.hidden:
                 x = nn.functional.relu(layer(x))
-            output= nn.functional.softmax(self.out(x), dim=1)
-
+            output = self.out(x)
             return output
 
              

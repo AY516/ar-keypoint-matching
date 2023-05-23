@@ -1,11 +1,8 @@
-import os.path as osp
 import argparse
-from typing import Optional
 from datetime import datetime
 from tqdm import tqdm
 
 import torch
-from torch_geometric.datasets import PascalVOCKeypoints as PascalVOC
 from utils.evaluation import *
 import torch_geometric.transforms as T
 from torch_geometric.data import DataLoader
@@ -48,7 +45,6 @@ def make_multi_label_tensor(y_gt_target, x_s_batch, x_t_batch):
     return out_tensor.to(device=device), perm_mat_gt.to(device=device)
 
 def train(epoch, writer, train_loader, val_loader):
-    
     model.train()
     metrics={}
     total_loss = 0
@@ -63,6 +59,7 @@ def train(epoch, writer, train_loader, val_loader):
         num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
 
         y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
+
         out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
                     data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
         
@@ -70,14 +67,15 @@ def train(epoch, writer, train_loader, val_loader):
         loss.backward()
 
         # grad norm
-        grad_norm_model = compute_grad_norm(model.parameters())
-        grad_norm_splineCNN = compute_grad_norm(model.spline.parameters())
-        grad_mlp_proj = compute_grad_norm(model.mlp_proj.parameters())
-        grad_mlp = compute_grad_norm(model.mlp.parameters())
-        writer.add_scalars('grad norms',{'model': grad_norm_model,
-                                        'grad norm Spline': grad_norm_splineCNN,
-                                        'grad norm tf': grad_mlp_proj,
-                                        'grad norm mlp': grad_mlp}, (epoch-1)*len(train_loader) + i)
+        # grad_norm_model = compute_grad_norm(model.parameters())
+        # grad_norm_splineCNN = compute_grad_norm(model.spline.parameters())
+        # grad_mlp_proj = compute_grad_norm(model.mlp_proj.parameters())
+        # grad_mlp = compute_grad_norm(model.mlp.parameters())
+        # writer.add_scalars('grad norms',{'model': grad_norm_model,
+        #                                 'grad norm Spline': grad_norm_splineCNN,
+        #                                 'grad norm tf': grad_mlp_proj,
+        #                                 'grad norm mlp': grad_mlp}, (epoch-1)*len(train_loader) + i)
+        
         # train accuracy
         C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
         y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
@@ -94,29 +92,30 @@ def train(epoch, writer, train_loader, val_loader):
     metrics['train_acc'] = train_total_correct / train_total_samples
     
     if val_loader != None:
-        model.eval()
+        # model.eval()
         valid_loss = 0.0
-        for i, data in enumerate(val_loader):
-            data = data.to(device)
+        with torch.no_grad():
+            for i, data in enumerate(val_loader):
+                data = data.to(device)
 
-            num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
-            num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
+                num_nodes_s = torch.max(torch.bincount(data.x_s_batch))
+                num_nodes_t = torch.max(torch.bincount(data.x_t_batch))
 
-            y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
-            out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
-                        data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
-            
-            C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
-            y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
-                                                for x in range(data.num_graphs)])).to(device)
-            perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
+                y_gt, perm_gt = make_multi_label_tensor(data.y, data.x_s_batch, data.x_t_batch)
+                out = model(data.x_s, data.edge_index_s, data.edge_attr_s, data.x_s_batch,
+                            data.x_t, data.edge_index_t, data.edge_attr_t, data.x_t_batch)
+                
+                C = -out.view(data.num_graphs, num_nodes_s, num_nodes_t)
+                y_pred = torch.tensor(np.array([linear_sum_assignment(C[x,:,:].detach().cpu().numpy()) 
+                                                    for x in range(data.num_graphs)])).to(device)
+                perm_pred = make_perm_mat_pred(y_pred[:,1,:], num_nodes_t).to(device)
 
-            _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
-            val_total_correct += num_correct
-            val_total_samples += num_samples
+                _, num_correct, num_samples = matching_accuracy(perm_pred, perm_gt)
+                val_total_correct += num_correct
+                val_total_samples += num_samples
 
-            loss = model.loss(out,y_gt)
-            valid_loss += loss.item() 
+                loss = model.loss(out,y_gt)
+                valid_loss += loss.item() 
 
         metrics['valid_loss'] = valid_loss / len(val_loader)
         metrics['valid_acc'] = val_total_correct / val_total_samples
@@ -171,24 +170,27 @@ def test(dataset):
 
 def run(dataset, train_loader, test_datasets, logdir, val_set):
     writer = SummaryWriter(logdir)
-    
+
     for epoch in tqdm(range(1, args.epochs+ 1)):
         train_metrics = train(epoch, writer,train_loader, val_set)
         loss = train_metrics['train_loss']
         train_acc = train_metrics['train_acc']
-
+        accs = [100 * test(test_dataset)[0] for test_dataset in test_datasets]
+        accs += [sum(accs) / len(accs)]
+        test_acc = accs[-1]
         
         writer.add_scalar('loss/train', train_metrics['train_loss'], epoch)
         writer.add_scalar('accuracy/train', train_metrics['train_acc'], epoch)
+        writer.add_scalar('accuracy/test', test_acc, epoch)
         
         if val_set != None:
             writer.add_scalar('loss/val', train_metrics['valid_loss'], epoch)
             writer.add_scalar('accuracy/val', train_metrics['valid_acc'], epoch)
-            val_acc = train_metrics['train_acc']
-            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Val_acc: {val_acc:.4f}')
+            val_acc = train_metrics['valid_acc']
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train_acc: {train_acc:.4f}, Val_acc: {val_acc:.4f}, Test_acc:{test_acc: .2f}')
 
         else:
-            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train_acc: {train_acc:.4f}')
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train_acc: {train_acc:.4f}, Test_acc:{test_acc: .2f}')
 
 
     
@@ -219,18 +221,23 @@ if __name__ == '__main__':
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_steps', type=int, default=10)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--batch_size', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--test_samples', type=int, default=1000)
 
     parser.add_argument('--mlp_hidden_dim', type=int, default=1024)
     parser.add_argument('--mlp_hidden_out', type=int, default=256)
     
-    parser.add_argument('--model_path', type=str, default='pascal.pt')
-    parser.add_argument('--dataset', type=str, default='PascalVOC')
+    parser.add_argument('--model_path', type=str, default='willowOBJ.pt')
+    
+    # logdir parameters
+    parser.add_argument('--model_name', type=str, default='MLP')
+    parser.add_argument('--dataset', type=str, default='WillowOBJ')
+    parser.add_argument('--exp_name', type=str, default='base_model')
+
 
     args = parser.parse_args()
-    log_dir="{}_SimpleNet_runs/{}".format(args.dataset, args.model_path + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    log_dir="{}_runs/{}/{}".format(args.dataset, args.model_name, args.exp_name)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(device)
 
@@ -245,7 +252,7 @@ if __name__ == '__main__':
                 'WillowOBJ': WillowObject(transform),
                 'Spair-71k': ""
                 }
-    dataset = datasets['PascalVOC']
+    dataset = datasets[args.dataset]
     train_dataset, test_datasets, num_node_features, num_edge_features = dataset.load_dataset()
 
     if dataset.have_validation_set():
